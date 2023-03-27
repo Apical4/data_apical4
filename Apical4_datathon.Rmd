@@ -1,0 +1,312 @@
+---
+title: "Apical4 Datathon"
+author: "Wenqi Zeng, Xiangxuan Yu, Jiayi Pan, Frank Sun"
+date: "2023-03-24"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Loading required library
+```{r,warning=FALSE,message=FALSE}       
+#install.packages('prophet')
+library(tidyverse)
+library(lubridate)
+library(prophet)
+library(dplyr)
+library(ggplot2)
+library(ISLR2)
+library(survival)
+```
+
+# Access data 
+```{r, message=FALSE,warning=FALSE}
+#reading the dataset
+training_data <- read_csv("/Users/zengwenqi/Desktop/training_data.csv")
+forecast_starting_data <- read_csv("/Users/zengwenqi/Desktop/forecast_starting_data.csv")
+```
+# Manipulate and exploring data
+```{r,message=FALSE,warning=FALSE}
+#including forecast starting dataset in 2020-01
+full_df = rbind(training_data,forecast_starting_data)
+```
+
+```{r,message=FALSE,warning=FALSE}
+#changing some data type to date format
+df2=full_df
+df2$snapshot<-lubridate::ym(df2$snapshot)
+df2$mth_code<-lubridate::ym(df2$mth_code)
+df2 <- df2 %>%
+  mutate(time_diff = as.numeric(interval(snapshot, mth_code) / months(1)))
+```
+
+```{r,message=FALSE,warning=FALSE}
+# count charge_off account in each month which is ending observation
+coun = df2 %>%
+  group_by(mth_code) %>%
+  summarise(total=sum(charge_off))
+```
+
+```{r,warning=FALSE,message=FALSE}
+library(ggplot2)
+
+ggplot(coun, aes(x = mth_code, y = total)) +
+  geom_bar(stat = "identity", fill = ifelse(1:nrow(coun) == which.max(coun$total),"#ec0900", "#7772f9") ) +
+  labs(x = "Date", y ="Number of Charge_off account" ) +
+  geom_text(aes(label = ifelse(1:nrow(coun) == which.max(coun$total), max(coun$total), "")), 
+            vjust = -0.2, color = "#0c0000") + 
+  geom_text(aes(label = ifelse(1:nrow(coun) == which.min(coun$total), min(coun$total), "")), 
+            vjust = -0.2, color = "#0c0000")+
+  theme(
+  panel.background = element_rect(fill = "white", 
+                                size = 2, linetype = "solid"),
+  panel.grid.major = element_line(size = 0.5, linetype = 'solid',
+                                colour = "lightgrey"), 
+  panel.grid.minor = element_line(size = 0.25, linetype = 'solid',
+                                colour = "lightgrey")
+  )
+```
+The number of charge_off increases along the time, with the number of 1186 in 2019/12.
+
+
+# Survival anaylsis to select variables to do the grouping
+
+We decided to use Cox Proportional Hazards Model as a reference to help us decide what variables in the training dataset should be picked up. At the end, we want to select related variables to group data at the aggregated level.
+```{r,message=FALSE,warning=FALSE}
+#We only have data from 2018-2019, we want to first drop continuous variables because we have no information about them for period after 2020. We keep and group by categorical variables as they only have several levels.
+first_removing=df2%>%
+  mutate(time_diff = as.numeric(interval(snapshot, mth_code) / months(1)))%>%
+  select(-contains("due_balance"))%>%
+  select(-c('snapshot','mth_code','account_status_code','bank_fico_buckets_20','charge_off_reason_code','writeoff_date','net_payment_behaviour_tripd',"mob","nbr_mths_due","variable_rate_margin":"net_payments","credit_limit_amt","credit_limit_pa","principal_amt":"recovery_amt"))%>%
+  drop_na()
+```
+
+
+```{r,message=FALSE,warning=FALSE}
+# first, to 
+fit.all <- coxph(Surv(time_diff,charge_off) ~., data=first_removing)
+summary(fit.all)
+```
+
+```{r,message=FALSE,warning=FALSE}
+#We drop categorigal variables that have very large p-value or p-value equals to NA
+second_removing=first_removing%>%
+  select(-c('closed','active','writeoff_type_other','writeoff_type_fraud_synthetic','writeoff_type_repo','writeoff_type_fraud_other','writeoff_type_null','due_account_8' ))
+fit.1 <- coxph(Surv(time_diff,charge_off) ~., data=second_removing)
+summary(fit.1)
+```
+
+```{r,message=FALSE,warning=FALSE}
+delip<- survfit(Surv(time_diff,charge_off) ~ ever_delinquent_flg, data=second_removing)
+plot(delip, xlab="Months",ylab="Survival Probability",col=2:3, main="Survival by ever_delinquent_flg",ylim=c(0.97,1))
+legend("bottomleft", c("ever_delinquent_flg=1 ","ever_delinquent_flg=0"), col = 2:3, lty = 1)
+```
+```{r}
+financial<- survfit(Surv(time_diff,charge_off) ~ financial_active , data=second_removing)
+plot(financial, xlab="Months",ylab="Survival Probability",col=2:3, main="Survival by customer's financial activity",ylim=c(0.975,1))
+legend("bottomleft", c("financial_active = 0","financial_active = 1"), col = 2:3, lty = 1)
+```
+
+```{r}
+promotion_flag<- survfit(Surv(time_diff,charge_off) ~ promotion_flag , data=second_removing)
+plot(financial, xlab="Months",ylab="Survival Probability",col=2:3, main="Survival by promotion_flag",ylim=c(0.975,1))
+legend("bottomleft", c("promotion_flag = 0","promotion_flag = 1"), col = 2:3, lty = 1)
+```
+
+```{r}
+ind<- survfit(Surv(time_diff,charge_off) ~ industry , data=second_removing)
+plot(ind, xlab="Months",ylab="Survival Probability",col=2:4, main="Survival by industry",ylim=c(0.975,1))
+legend("bottomleft", c("industry = A","industry = B", "industry = C"), col = 2:4, lty = 1)
+```
+
+With the fit.1 model, we detect 4 variables that have both statistical meanings and economic meanings in this context, which is financial_active, industry, ever_delinquent_fl, and promotion_flag. When looking at the Kaplan Meier (KM) survival curves, we noticed that industry and financial_active have very obvious different probabilities between each levels and may have significant effects on charge_off activities. Therefore, we decided to pick up these two variables to group and stratify the data at the end in order to make prediction more accurate.
+
+
+# Model forecasting
+
+### predict in a original data without grouping data by the variables we detected above
+```{r,message=FALSE,warning=FALSE}
+#import macro dataset
+macro <- read_csv("/Users/zengwenqi/Desktop/macro_data.csv", 
+    col_names = FALSE, col_types = cols(X1 = col_date(format = "%m/%d/%Y")))
+colnames(macro)[colnames(macro) == "X1"] <- "mth_code"
+macro$mth_code <- as.Date(sub("\\d{2}$", "01", macro$mth_code))
+macro=macro[9:440,]
+macro
+```
+
+```{r,message=FALSE,warning=FALSE}
+#macro data during predicting period
+prediction_macro=macro[macro$mth_code>='2020-02-01' & macro$mth_code<='2021-01-01',]
+colnames(prediction_macro)=c('ds',paste('macro',1:96,sep=''))
+prediction_macro
+```
+
+
+```{r,message=FALSE,warning=FALSE}
+filtered_macro_train=macro[macro$mth_code>='2018-01-01' & macro$mth_code<='2020-01-01', ]
+
+training_data2=df2%>%
+  group_by(mth_code)%>%
+  summarize(sum_chargeoff=sum(charge_off))%>%
+  ungroup()%>%
+  left_join(filtered_macro_train,by='mth_code')
+
+#changing col names
+colnames(training_data2)=c('ds','y',paste('macro',1:96,sep=''))
+training_data2
+```
+
+
+
+```{r,message=FALSE,warning=FALSE}
+#using fb prophet forecasting procedure to perform a Time Series forecasting
+
+#idenity all regressors
+regressors <- training_data2 %>% select(-ds, -y)
+
+#fitting all regressors
+for (col in names(regressors)) {
+  model <- prophet() %>% add_regressor(col, mode = "additive")
+}
+
+#fitting the model
+model <- fit.prophet(model, training_data2)
+
+#tail
+tail(prediction_macro)
+
+#predict the future
+forecast <- predict(model, prediction_macro)
+par(bg="white")
+
+plot(model, forecast,panels = NULL,xlab='months',ylab='accounts charged off')+
+  theme(
+  panel.background = element_rect(fill = "white", 
+                                size = 2, linetype = "solid"),
+  panel.grid.major = element_line(size = 0.5, linetype = 'solid',
+                                colour = "lightgrey"), 
+  panel.grid.minor = element_line(size = 0.25, linetype = 'solid',
+                                colour = "lightgrey")
+  )
+
+
+prophet_plot_components(model,forecast)
+
+#cross-validation to test model's accuracy
+df.cv <- cross_validation(model, initial=180, period=60, horizon=120, units='days')
+df.cv <- slice(df.cv, 1:(nrow(df.cv)-1))
+
+#plotting to visualize the accuracy
+plot_cross_validation_metric(df.cv, metric = 'mape') +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 100))+
+  theme(
+  panel.background = element_rect(fill = "white", 
+                                size = 2, linetype = "solid"),
+  panel.grid.major = element_line(size = 0.5, linetype = 'solid',
+                                colour = "lightgrey"), 
+  panel.grid.minor = element_line(size = 0.25, linetype = 'solid',
+                                colour = "lightgrey")
+  )
+```
+
+### The final prediction for the period of 2020/02 - 2021/01
+```{r,message=FALSE,warning=FALSE}
+forecasting=forecast
+forecasting$ds= format(forecasting$ds, "%Y-%m")
+forecasting=forecasting%>%select(ds,yhat)
+colnames(forecasting)=c('month','accounts_charged_off')
+forecasting
+```
+
+
+## Make prediction based on industries and financial_active
+
+### function for prediction
+```{r,message=FALSE,warning=FALSE}
+#using fb prophet forecasting procedure to perform a Time Series forecasting
+fb_prophet=function(training,prediction_macro){
+  #idenity all regressors
+  regressors <- training %>% select(-ds, -y)
+  #fitting all regressors
+  for (col in names(regressors)) {
+    model <- prophet() %>% add_regressor(col, mode = "additive")
+  }
+  #fitting the model
+  model <- fit.prophet(model, training)
+
+  #tail
+  tail(prediction_macro)
+
+  #predict the future
+  forecast <- predict(model, prediction_macro)
+  plot(model, forecast,bg='white')+  theme(
+  panel.background = element_rect(fill = "white", 
+                                size = 2, linetype = "solid"),
+  panel.grid.major = element_line(size = 0.5, linetype = 'solid',
+                                colour = "lightgrey"), 
+  panel.grid.minor = element_line(size = 0.25, linetype = 'solid',
+                                colour = "lightgrey")
+  )
+    
+}
+```
+
+### Industry level
+```{r,message=FALSE,warning=FALSE}
+training_data_indusA=df2[df2$industry=='A',]
+filtered_macro_train=macro[macro$mth_code>='2018-01-01' & macro$mth_code<='2020-01-01', ]
+training_data_indusA=training_data_indusA%>%
+  group_by(mth_code)%>%
+  summarize(sum_chargeoff=sum(charge_off))%>%
+  ungroup()%>%
+  left_join(filtered_macro_train,by='mth_code')
+colnames(training_data_indusA)=c('ds','y',paste('macro',1:96,sep=''))
+fb_prophet(training_data_indusA,prediction_macro=prediction_macro)
+
+training_data_indusB=df2[df2$industry=='B',]
+filtered_macro_train=macro[macro$mth_code>='2018-01-01' & macro$mth_code<='2020-01-01', ]
+training_data_indusB=training_data_indusB%>%
+  group_by(mth_code)%>%
+  summarize(sum_chargeoff=sum(charge_off))%>%
+  ungroup()%>%
+  left_join(filtered_macro_train,by='mth_code')
+colnames(training_data_indusB)=c('ds','y',paste('macro',1:96,sep=''))
+fb_prophet(training_data_indusB,prediction_macro=prediction_macro)
+
+training_data_indusC=df2[df2$industry=='C',]
+filtered_macro_train=macro[macro$mth_code>='2018-01-01' & macro$mth_code<='2020-01-01', ]
+training_data_indusC=training_data_indusC%>%
+  group_by(mth_code)%>%
+  summarize(sum_chargeoff=sum(charge_off))%>%
+  ungroup()%>%
+  left_join(filtered_macro_train,by='mth_code')
+colnames(training_data_indusC)=c('ds','y',paste('macro',1:96,sep=''))
+fb_prophet(training_data_indusC,prediction_macro=prediction_macro)
+```
+
+### Financial active level
+```{r,message=FALSE,warning=FALSE}
+training_data_active=df2[df2$financial_active==1,]
+filtered_macro_train=macro[macro$mth_code>='2018-01-01' & macro$mth_code<='2020-01-01', ]
+training_data_active=training_data_active%>%
+  group_by(mth_code)%>%
+  summarize(sum_chargeoff=sum(charge_off))%>%
+  ungroup()%>%
+  left_join(filtered_macro_train,by='mth_code')
+colnames(training_data_active)=c('ds','y',paste('macro',1:96,sep=''))
+fb_prophet(training_data_active,prediction_macro=prediction_macro)
+
+training_data_inactive=df2[df2$financial_active==0,]
+filtered_macro_train=macro[macro$mth_code>='2018-01-01' & macro$mth_code<='2020-01-01', ]
+training_data_inactive=training_data_inactive%>%
+  group_by(mth_code)%>%
+  summarize(sum_chargeoff=sum(charge_off))%>%
+  ungroup()%>%
+  left_join(filtered_macro_train,by='mth_code')
+colnames(training_data_inactive)=c('ds','y',paste('macro',1:96,sep=''))
+fb_prophet(training_data_inactive,prediction_macro=prediction_macro)
+```
+
+
+
